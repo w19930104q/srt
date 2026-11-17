@@ -2,6 +2,8 @@
 
 import argparse
 import codecs
+import csv
+import io
 import srt
 import logging
 import sys
@@ -213,6 +215,29 @@ def compose_suggest_on_fail(subs, strict=True):
             "with --encoding?"
         )
         raise
+
+
+def compose_csv(subtitles):
+    """
+    Render subtitles as a CSV document with the columns
+    ``index,start,end,content``. Timestamps use the SRT timestamp format, and
+    content is exported verbatim, so markup tags (known or unknown) are
+    preserved. Useful for diffing or inspecting the result of a
+    transformation pipeline.
+    """
+    output = io.StringIO()
+    writer = csv.writer(output, lineterminator="\n")
+    writer.writerow(["index", "start", "end", "content"])
+    for subtitle in subtitles:
+        writer.writerow(
+            [
+                subtitle.index,
+                srt.timedelta_to_srt_timestamp(subtitle.start),
+                srt.timedelta_to_srt_timestamp(subtitle.end),
+                subtitle.content,
+            ]
+        )
+    return output.getvalue()
 
 
 def sliding_window(seq, width=2, inclusive=True):

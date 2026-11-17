@@ -3,6 +3,8 @@
 """Shifts a subtitle by a fixed number of seconds."""
 
 import datetime
+import io
+import srt
 import srt_tools.utils
 import logging
 
@@ -19,28 +21,61 @@ def parse_args():
     parser.add_argument(
         "--seconds", type=float, required=True, help="how many seconds to shift"
     )
+    parser.add_argument(
+        "--no-clamp",
+        action="store_true",
+        help="don't clamp shifted timestamps to be >= 0 (negative cues are "
+        "dropped instead, the pre-3.6 behaviour)",
+    )
+    parser.add_argument(
+        "--keep-overlaps",
+        action="store_true",
+        help="don't trim cues that overlap the following cue",
+    )
+    parser.add_argument(
+        "--csv",
+        metavar="FILE",
+        help="also export the resulting cues to FILE as CSV "
+        "(columns: index,start,end,content)",
+    )
     return parser.parse_args()
 
 
 def scalar_correct_subs(subtitles, seconds_to_shift):
     td_to_shift = datetime.timedelta(seconds=seconds_to_shift)
-    for subtitle in subtitles:
-        subtitle.start += td_to_shift
-        subtitle.end += td_to_shift
-        yield subtitle
+    return srt.shift_times(subtitles, td_to_shift, in_place=True)
 
 
 def main():
     args = parse_args()
     logging.basicConfig(level=args.log_level)
     srt_tools.utils.set_basic_args(args)
+
+    # The pipeline is built from composable steps: shift, then (by default)
+    # clamp negative times to zero and trim overlapping cues, then
+    # sort/reindex on compose.
     corrected_subs = scalar_correct_subs(args.input, args.seconds)
+    if not args.no_clamp:
+        corrected_subs = srt.clamp_times(corrected_subs, in_place=True)
+    if not args.keep_overlaps:
+        corrected_subs = srt.trim_overlaps(corrected_subs, in_place=True)
+
+    if args.csv:
+        # We need the cues twice (SRT and CSV), so materialise them. compose
+        # reindexes in place, so CSV export afterwards sees final indexes.
+        corrected_subs = list(corrected_subs)
+
     output = srt_tools.utils.compose_suggest_on_fail(corrected_subs, strict=args.strict)
 
     try:
         args.output.write(output)
     except (UnicodeEncodeError, TypeError):  # Python 2 fallback
         args.output.write(output.encode(args.encoding))
+
+    if args.csv:
+        csv_output = srt_tools.utils.compose_csv(sorted(corrected_subs))
+        with io.open(args.csv, "w", encoding=args.encoding or "utf-8") as csv_file:
+            csv_file.write(csv_output)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -771,3 +771,149 @@ def test_parse_file_with_missing_index(input_subs):  # cf. issue #51
 
     # ...and sort the same.
     assert srt.compose(subs_no_index) == srt.compose(subs_zero_index)
+
+
+MIXED_TAG_CONTENT = (
+    '<i>italic</i> and <font color="#ff0000">red</font> '
+    'with <custom-tag a="b">unknown</custom-tag> & a < 3 literal'
+)
+
+BOUNDARY_SRT = """\
+1
+00:00:01,000 --> 00:00:03,000
+<font color="#ff0000">first</font> line
+
+2
+00:00:02,500 --> 00:00:04,000
+<i>overlapping</i> second
+
+3
+00:00:00,500 --> 00:00:00,800
+<custom>tiny</custom>
+
+"""
+
+
+def test_content_to_tokens_preserves_unknown_tags():
+    tokens = srt.content_to_tokens(MIXED_TAG_CONTENT)
+    tags = [value for kind, value in tokens if kind == "tag"]
+    assert tags == [
+        "<i>",
+        "</i>",
+        '<font color="#ff0000">',
+        "</font>",
+        '<custom-tag a="b">',
+        "</custom-tag>",
+    ]
+    # "a < 3 literal" is not a tag and must survive as text
+    texts = [value for kind, value in tokens if kind == "text"]
+    assert any("< 3" in text for text in texts)
+
+
+@given(st.text())
+def test_content_token_roundtrip(content):
+    assert srt.tokens_to_content(srt.content_to_tokens(content)) == content
+
+
+def test_shift_times_roundtrip():
+    subs = list(srt.parse(BOUNDARY_SRT))
+    shifted = list(srt.shift_times(subs, timedelta(seconds=5)))
+    for original, new in zip(subs, shifted):
+        assert new.start == original.start + timedelta(seconds=5)
+        assert new.end == original.end + timedelta(seconds=5)
+        # Content, including unknown tags, is untouched
+        assert new.content == original.content
+        # Originals are not mutated by default
+        assert original.start < new.start
+
+    unshifted = list(srt.shift_times(shifted, timedelta(seconds=-5)))
+    subs_eq(unshifted, subs)
+
+
+def test_shift_times_in_place():
+    sub = srt.Subtitle(1, timedelta(seconds=1), timedelta(seconds=2), "x")
+    list(srt.shift_times([sub], timedelta(seconds=5), in_place=True))
+    assert sub.start == timedelta(seconds=6)
+
+
+def test_clamp_times_negative_start_clamped_not_dropped():
+    subs = list(srt.parse(BOUNDARY_SRT))
+    shifted = srt.shift_times(subs, timedelta(seconds=-2))
+    clamped = list(srt.clamp_times(shifted))
+
+    # Cue 1: -1s..1s -> clamped to 0s..1s (kept, not dropped)
+    assert clamped[0].start == srt.ZERO_TIMEDELTA
+    assert clamped[0].end == timedelta(seconds=1)
+    # Cue 3: -1.5s..-1.2s -> fully before zero, dropped
+    assert len(clamped) == 2
+    assert all(sub.start >= srt.ZERO_TIMEDELTA for sub in clamped)
+
+
+def test_trim_overlaps_trims_to_next_start():
+    subs = list(srt.parse(BOUNDARY_SRT))
+    trimmed = list(srt.trim_overlaps(subs))
+    # Output is sorted by start time: cue 3, cue 1, cue 2
+    assert trimmed == sorted(trimmed)
+    # Cue 1 (1s..3s) overlaps cue 2 (2.5s..4s): end trimmed to 2.5s
+    assert trimmed[1].end == timedelta(seconds=2, milliseconds=500)
+    assert trimmed[2].end == timedelta(seconds=4)
+
+
+def test_trim_overlaps_trims_around_contained_cues():
+    subs = [
+        srt.Subtitle(1, timedelta(seconds=1), timedelta(seconds=10), "outer"),
+        srt.Subtitle(2, timedelta(seconds=2), timedelta(seconds=3), "inner"),
+    ]
+    trimmed = list(srt.trim_overlaps(subs))
+    # The outer cue is trimmed to the inner cue's start; both survive.
+    assert [sub.content for sub in trimmed] == ["outer", "inner"]
+    assert trimmed[0].end == timedelta(seconds=2)
+
+
+def test_trim_overlaps_drops_zero_duration_cues():
+    subs = [
+        srt.Subtitle(1, timedelta(seconds=1), timedelta(seconds=2), "a"),
+        srt.Subtitle(2, timedelta(seconds=1), timedelta(seconds=3), "b"),
+    ]
+    trimmed = list(srt.trim_overlaps(subs))
+    # "a" is trimmed to start == end and dropped.
+    assert [sub.content for sub in trimmed] == ["b"]
+
+
+def test_composable_pipeline_roundtrip_preserves_tags():
+    subs = list(srt.parse(BOUNDARY_SRT))
+
+    def pipeline(sub_iter, seconds):
+        return srt.sort_and_reindex(
+            srt.trim_overlaps(
+                srt.clamp_times(srt.shift_times(sub_iter, timedelta(seconds=seconds)))
+            )
+        )
+
+    # Shift forward and back: no cue hits a boundary, so the round trip
+    # must reproduce the original cue list exactly, tags included.
+    forward = list(pipeline(subs, 30))
+    back = list(pipeline(forward, -30))
+    subs_eq(back, srt.sort_and_reindex(srt.trim_overlaps(subs)))
+
+    for sub in back:
+        assert srt.tokens_to_content(srt.content_to_tokens(sub.content)) == sub.content
+
+    # And the composed output still parses to the same cues.
+    reparsed = list(srt.parse(srt.compose(back)))
+    subs_eq(reparsed, back)
+
+
+def test_composable_pipeline_boundary_shift():
+    subs = list(srt.parse(BOUNDARY_SRT))
+    shifted = srt.shift_times(subs, timedelta(seconds=-2))
+    result = list(srt.sort_and_reindex(srt.trim_overlaps(srt.clamp_times(shifted))))
+    # Cue 3 was shifted entirely before zero and dropped by clamping; cue 1
+    # was clamped to zero and trimmed against cue 2.
+    assert [sub.index for sub in result] == [1, 2]
+    assert result[0].start == srt.ZERO_TIMEDELTA
+    assert result[0].end == timedelta(milliseconds=500)
+    assert result[1].start == timedelta(milliseconds=500)
+    # Unknown tags survive the whole pipeline.
+    assert '<font color="#ff0000">' in result[0].content
+    assert "<i>" in result[1].content

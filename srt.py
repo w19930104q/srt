@@ -44,8 +44,15 @@ RGX_PROPRIETARY = r"[^\r\n]*"
 RGX_CONTENT = r".*?"
 RGX_POSSIBLE_CRLF = r"\r?\n"
 
+# Any HTML-like tag, known (``<i>``, ``<b>``, ...) or unknown/proprietary
+# (``<font color="red">``, ``<custom>``, ...). Unknown tags are treated as
+# opaque tokens so that they survive parsing and transformation pipelines
+# untouched. A lone "<" with no closing ">" is considered plain text.
+RGX_TAG = r"</?[^<>]+>"
+
 TS_REGEX = re.compile(RGX_TIMESTAMP_PARSEABLE)
 MULTI_WS_REGEX = re.compile(r"\n\n+")
+TAG_REGEX = re.compile(RGX_TAG)
 SRT_REGEX = re.compile(
     r"\s*(?:({idx})\s*{eof})?({ts}) *-[ -] *> *({ts}) ?({proprietary})(?:{eof}|\Z)({content})"
     # Many sub editors don't add a blank line to the end, and many editors and
@@ -207,6 +214,56 @@ def make_legal_content(content):
     return legal_content
 
 
+def content_to_tokens(content):
+    r"""
+    Split subtitle content into a list of ``(kind, value)`` tokens, where
+    ``kind`` is either ``"text"`` or ``"tag"``.
+
+    Both known tags (like ``<i>``) and unknown or proprietary tags (like
+    ``<font color="red">``) are captured as opaque ``tag`` tokens, so that
+    text-processing steps can work on the ``text`` tokens alone without
+    silently dropping markup they don't understand.
+
+    .. doctest::
+
+        >>> content_to_tokens('a <font color="red">b</font> <3')
+        [('text', 'a '), ('tag', '<font color="red">'), ('text', 'b'), ('tag', '</font>'), ('text', ' <3')]
+
+    :param str content: The subtitle content to tokenise
+    :returns: A list of ``(kind, value)`` tokens
+    :rtype: list of (str, str) tuples
+    """
+    tokens = []
+    pos = 0
+    for match in TAG_REGEX.finditer(content):
+        if match.start() > pos:
+            tokens.append(("text", content[pos : match.start()]))
+        tokens.append(("tag", match.group()))
+        pos = match.end()
+    if pos < len(content):
+        tokens.append(("text", content[pos:]))
+    return tokens
+
+
+def tokens_to_content(tokens):
+    r"""
+    Recombine tokens from :py:func:`content_to_tokens` back into subtitle
+    content. ``tokens_to_content(content_to_tokens(c)) == c`` for any ``c``.
+
+    .. doctest::
+
+        >>> tokens = content_to_tokens('x <font size="+1">y</font>')
+        >>> tokens_to_content(tokens)
+        'x <font size="+1">y</font>'
+
+    :param tokens: ``(kind, value)`` tokens, as from
+                   :py:func:`content_to_tokens`
+    :returns: The recombined subtitle content
+    :rtype: str
+    """
+    return "".join(value for _kind, value in tokens)
+
+
 def timedelta_to_srt_timestamp(timedelta_timestamp):
     r"""
     Convert a :py:class:`~datetime.timedelta` to an SRT timestamp.
@@ -324,6 +381,134 @@ def _should_skip_sub(subtitle):
     for info_msg, sub_skipper in SUBTITLE_SKIP_CONDITIONS:
         if sub_skipper(subtitle):
             raise _ShouldSkipException(info_msg)
+
+
+def shift_times(subtitles, offset, in_place=False):
+    r"""
+    Shift all subtitles by a fixed offset. This is a composable pipeline step:
+    it can be chained freely with :py:func:`clamp_times`,
+    :py:func:`trim_overlaps`, and :py:func:`sort_and_reindex`, for example
+    ``sort_and_reindex(trim_overlaps(clamp_times(shift_times(subs, td))))``.
+
+    Subtitle content (including any unknown markup tags) is passed through
+    untouched.
+
+    .. doctest::
+
+        >>> from datetime import timedelta
+        >>> subs = [Subtitle(1, timedelta(seconds=1), timedelta(seconds=2), 'x')]
+        >>> list(shift_times(subs, timedelta(seconds=5)))  # doctest: +ELLIPSIS
+        [Subtitle(...start=datetime.timedelta(seconds=6)...)]
+
+    :param subtitles: :py:class:`Subtitle` objects in any order
+    :param datetime.timedelta offset: The (possibly negative) offset to shift
+                                      all start and end times by
+    :param bool in_place: Whether to modify subs in-place for performance
+    :returns: The shifted subtitles, in input order
+    :rtype: :term:`generator` of :py:class:`Subtitle` objects
+    """
+    for subtitle in subtitles:
+        if not in_place:
+            subtitle = Subtitle(**vars(subtitle))
+        subtitle.start += offset
+        subtitle.end += offset
+        yield subtitle
+
+
+def clamp_times(subtitles, minimum=ZERO_TIMEDELTA, in_place=False):
+    """
+    Clamp subtitle start and end times so that none are before ``minimum``
+    (zero by default). This is the fixed policy for negative times: instead of
+    dropping a cue that was shifted before the start of the video, its start
+    (and end, if needed) is clamped to ``minimum``. Cues whose end is not
+    strictly after their start after clamping are dropped, since they can
+    never be displayed.
+
+    This is a composable pipeline step, see :py:func:`shift_times` for an
+    example.
+
+    .. doctest::
+
+        >>> from datetime import timedelta
+        >>> neg = timedelta(seconds=-1)
+        >>> one = timedelta(seconds=1)
+        >>> subs = [Subtitle(1, neg, one, 'x'), Subtitle(2, neg, neg, 'y')]
+        >>> list(clamp_times(subs))  # doctest: +ELLIPSIS
+        [Subtitle(...content='x'...)]
+
+    :param subtitles: :py:class:`Subtitle` objects in any order
+    :param datetime.timedelta minimum: The earliest allowed timestamp
+    :param bool in_place: Whether to modify subs in-place for performance
+    :returns: The clamped subtitles, in input order
+    :rtype: :term:`generator` of :py:class:`Subtitle` objects
+    """
+    for subtitle in subtitles:
+        if not in_place:
+            subtitle = Subtitle(**vars(subtitle))
+
+        if subtitle.start < minimum:
+            subtitle.start = minimum
+        if subtitle.end < minimum:
+            subtitle.end = minimum
+
+        if subtitle.start >= subtitle.end:
+            LOG.info(
+                "Dropped subtitle at index %s: no displayable time remains "
+                "after clamping to %r",
+                subtitle.index,
+                minimum,
+            )
+            continue
+
+        yield subtitle
+
+
+def trim_overlaps(subtitles, in_place=False):
+    """
+    Resolve overlapping cues with a fixed policy: subtitles are considered in
+    start time order, and any cue whose end runs into the next cue's start has
+    its end trimmed to that start. Cues thereby reduced to no displayable
+    time (for example, a cue starting at the same time as an earlier cue) are
+    dropped.
+
+    This is a composable pipeline step, see :py:func:`shift_times` for an
+    example. Since trimming is defined over start time order, the output is
+    sorted by start time; chain with :py:func:`sort_and_reindex` to also fix
+    up indexes.
+
+    .. doctest::
+
+        >>> from datetime import timedelta
+        >>> one, two, three = (timedelta(seconds=s) for s in (1, 2, 3))
+        >>> subs = [Subtitle(1, one, three, 'x'), Subtitle(2, two, three, 'y')]
+        >>> list(trim_overlaps(subs))  # doctest: +ELLIPSIS
+        [Subtitle(...end=datetime.timedelta(seconds=2)...), Subtitle(...)]
+
+    :param subtitles: :py:class:`Subtitle` objects in any order
+    :param bool in_place: Whether to modify subs in-place for performance
+    :returns: The trimmed subtitles, sorted by start time
+    :rtype: :term:`generator` of :py:class:`Subtitle` objects
+    """
+    if in_place:
+        ordered = sorted(subtitles)
+    else:
+        ordered = sorted(Subtitle(**vars(subtitle)) for subtitle in subtitles)
+
+    for position, subtitle in enumerate(ordered):
+        if position + 1 < len(ordered):
+            next_subtitle = ordered[position + 1]
+            if subtitle.end > next_subtitle.start:
+                subtitle.end = next_subtitle.start
+
+        if subtitle.start >= subtitle.end:
+            LOG.info(
+                "Dropped subtitle at index %s: fully covered by an "
+                "overlapping subtitle",
+                subtitle.index,
+            )
+            continue
+
+        yield subtitle
 
 
 def parse(srt, ignore_errors=False):
